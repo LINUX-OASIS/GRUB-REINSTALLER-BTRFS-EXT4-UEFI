@@ -1,6 +1,6 @@
 # ✨ BTRFS Subvolume Converter ✨
 
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Shellcheck](https://img.shields.io/badge/Shellcheck-Passing-brightgreen.svg)](#)
 [![Compatibility](https://img.shields.io/badge/Compatibility-Debian%20%7C%20Ubuntu%20%7C%20Mint-orange.svg)](#compatibility)
 [![Made with](https://img.shields.io/badge/Made%20with-Bash%20&%20Whiptail-lightgrey.svg)](#)
@@ -104,7 +104,7 @@ For those curious about the magic behind the curtain, here is the step-by-step p
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the **GNU General Public License v3.0** - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
