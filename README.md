@@ -1,16 +1,11 @@
 # ✨ BTRFS Subvolume Converter ✨
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Issues](https://img.shields.io/github/issues/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=yellow)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER/issues)
-[![Pull Requests](https://img.shields.io/github/issues-pr/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=brightgreen)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER/pulls)
-[![Stars](https://img.shields.io/github/stars/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=orange)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER/stargazers)
-[![Forks](https://img.shields.io/github/forks/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=blueviolet)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER/network/members)
-[![Last Commit](https://img.shields.io/github/last-commit/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=success)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER/commits/main)
-[![Repo Size](https://img.shields.io/github/repo-size/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=blue)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER)
-[![Top Language](https://img.shields.io/github/languages/top/your-username/BTRFS-SUBVOLUME-CONVERTER.svg?color=brightgreen)](https://github.com/your-username/BTRFS-SUBVOLUME-CONVERTER)
+[![Shellcheck](https://img.shields.io/badge/Shellcheck-Passing-brightgreen.svg)](#)
+[![Compatibility](https://img.shields.io/badge/Compatibility-Debian%20%7C%20Ubuntu%20%7C%20Mint-orange.svg)](#compatibility)
+[![Made with](https://img.shields.io/badge/Made%20with-Bash%20&%20Whiptail-lightgrey.svg)](#)
 
-> [!IMPORTANT]  
-> ![Danger](https://img.shields.io/badge/DANGER-CRITICAL%20FILESYSTEM%20OPERATION-red.svg)
+![Danger](https://img.shields.io/badge/DANGER-CRITICAL%20FILESYSTEM%20OPERATION-red.svg)
 
 A powerful shell script with a friendly terminal UI to convert a standard Ubuntu/Debian BTRFS installation into a proper subvolume layout (`@` for root, `@home` for home). This is the layout required by tools like Timeshift and Snapper to enable system snapshots and rollbacks.
 
@@ -110,24 +105,6 @@ For those curious about the magic behind the curtain, here is the step-by-step p
 ## 📜 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
----
-
-## 🤝 Contributing
-
-Pull requests, issues, and suggestions are warmly welcomed! For major changes, please open an issue first to discuss what you would like to change.
-
----
-
-## 🧙‍♂️ Maintainer
-
-- your-username
-
----
-
-## ✨ Star & Fork
-
-If you find this project useful, please consider giving it a star ⭐ and forking it to explore your own ideas! Your support helps motivate further development and community engagement.
 
 ## 🙏 Acknowledgments
 
