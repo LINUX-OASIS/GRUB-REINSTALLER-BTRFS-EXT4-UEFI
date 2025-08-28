@@ -1,0 +1,529 @@
+#!/bin/bash
+
+# #############################################################################
+#
+#          GRUB Reinstaller for BTRFS/EXT4 on UEFI Systems
+#
+#  This script provides an interactive way to reinstall the GRUB bootloader
+#  for Linux distributions installed on BTRFS or EXT4 filesystems. It is
+#  specifically designed for UEFI-based systems and uses a chroot environment
+#  to ensure the GRUB installation is performed correctly within the context
+#  of the target operating system.
+#
+#  Author: LINUX-OASIS (formerly LINUX-LIVING)
+#  Cleanup & Logic Refinement: Gemini
+#
+#  Execution Flow:
+#    1.  Environment Check: The script first asks if you are running it from
+#        INSIDE the OS you want to fix, or OUTSIDE (e.g., from a Live USB).
+#
+#    2.  "Inside" Workflow (No Chroot):
+#        - If run from inside, it performs a simple GRUB reinstall without chroot.
+#        - It corrects /etc/fstab and runs grub-install directly.
+#
+#    3.  "Outside" Workflow (Chroot):
+#        a. Partition Selection: Asks for the target OS partition and the EFI partition.
+#        b. Filesystem Detection: Checks if the OS partition is BTRFS or EXT4 and
+#           routes to the appropriate function.
+#        c. Cleanup Safety Net: A 'trap' is set. This is a critical safety
+#           feature that ensures the FUN_CLEANUP_CHROOT function runs if the
+#           script is interrupted, preventing leftover mounts.
+#        d. Mounting:
+#           - For BTRFS, it handles subvolume selection.
+#           - It mounts the OS partition to a temporary directory.
+#        e. Fstab Correction: It automatically finds and replaces the EFI partition
+#           identifier in the target system's /etc/fstab file.
+#        f. Chroot Preparation: It bind-mounts /dev, /proc, and /sys, and mounts
+#           the EFI partition into the temporary directory structure.
+#        g. GRUB Installation: It enters the chroot environment and executes
+#           'grub-install' and 'update-grub'.
+#        h. Cleanup: After the chroot command finishes, it calls the cleanup
+#           function to unmount everything safely and then disables the trap.
+#
+# #############################################################################
+
+# --- Display a welcome banner ---
+echo "░▐█▄▄▄▄▄▄▄▄▄█▄☆░███████████░▓▓▓▓▓▓▓▓▓▓▓▓██▓▓▓▓▓▓▓▓◤╬▀░▐▓▓▓▓▓▓▌▀█░░░█▀░▒░░▓▓▓▓▓▓█▄▄▄▄▄█▀╬░░░█▓▓▓▓▓▌░▒▒▒▒▒▒▒▒▒░▐█▓▓▓▓▓░░▒▒▒▒▒▒▒▒▒░▐██████▌╬░▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓██▓▓▓▓▓▓▓▓◤╬▀░▐▓▓▓▓▓▓▌▀█░░░█▀░▒░░▓▓▓▓▓▓█▄▄▄▄▄█▀╬░░░█▓▓▓▓▓▌░▒▒▒▒▒▒▒▒▒░▐█▓▓▓▓▓░░▒▒▒▒▒▒▒▒▒░▐██████▌╬░▒▒▒▒▒▒▒▒"
+echo "Made By.............. LINUX-OASIS"
+
+##############################################################################################################################
+
+# ==============================================================================
+# FUNCTION: FUN_CLEANUP_CHROOT
+#
+# DESCRIPTION:
+#   Safely unmounts all filesystems associated with the chroot environment.
+#   This is the script's most critical safety feature, ensuring that no mounts
+#   are left behind, which would cause errors on subsequent runs.
+#
+# PARAMETERS:
+#   $1 - The temporary mount point used for the OS partition.
+#        (e.g., /tmp/MOUNT-GRUB-REINSTALL-dev-sda2)
+#
+# ==============================================================================
+function FUN_CLEANUP_CHROOT {
+	local mount_point="$1"
+
+	echo "--- Running cleanup for $mount_point ---"
+
+	# --- Unmount Sequence ---
+	# Unmount filesystems in the reverse order they were mounted to avoid
+	# "target is busy" errors. The `-lf` flags are used for a lazy and
+	#	# forced unmount, which is more robust.
+	# Errors are redirected to /dev/null to suppress unnecessary warnings if a
+	# filesystem is already unmounted.
+	sudo umount -lf "$mount_point/usr" 2>/dev/null
+	sudo umount -lf "$mount_point/sys" 2>/dev/null
+	sudo umount -lf "$mount_point/proc" 2>/dev/null
+	sudo umount -lf "$mount_point/dev/pts" 2>/dev/null
+	sudo umount -lf "$mount_point/dev" 2>/dev/null
+
+	# Unmount the EFI partition if it was mounted.
+	if mountpoint -q "$mount_point/boot/efi"; then
+		sudo umount -lf "$mount_point/boot/efi" 2>/dev/null
+	fi
+
+	# Finally, unmount the main OS partition.
+	sudo umount -lf "$mount_point" 2>/dev/null
+
+	echo "Cleanup complete."
+}
+
+# ==============================================================================
+# FUNCTION: FUN_FSTAB_FIXER
+#
+# DESCRIPTION:
+#   Safely finds and replaces the /boot/efi entry in a given fstab file.
+#   It correctly handles both UUID= and /dev/disk/by-uuid/ formats.
+#
+# PARAMETERS:
+#   $1 - The path to the fstab file to be modified.
+#
+# ==============================================================================
+function FUN_FSTAB_FIXER {
+	local target_fstab="$1"
+
+	# --- Safely find and replace the EFI entry in the target's /etc/fstab ---
+	# 1. Find the actual fstab entry for /boot/efi, ignoring any comment lines.
+	FSTAB_EFI_LINE=$(grep -v '^[[:space:]]*#' "$target_fstab" | grep -w '/boot/efi')
+
+	# 2. Get the UUID of the NEW partition the user selected.
+	NEW_UUID=$(blkid -s UUID -o value "$EFI_ESP_PARTITION_DEV")
+	NEW_DEVICE_IDENTIFIER="/dev/disk/by-uuid/$NEW_UUID"
+
+	# 3. Check if an old EFI line was actually found.
+	if [ -n "$FSTAB_EFI_LINE" ]; then
+		echo "Found existing EFI entry: $FSTAB_EFI_LINE"
+		# 4. Extract the OLD device identifier (the entire first column).
+		OLD_DEVICE_IDENTIFIER=$(echo "$FSTAB_EFI_LINE" | awk '{print $1}')
+
+		# 5. Replace the old identifier with the new one.
+		echo "Replacing $OLD_DEVICE_IDENTIFIER with $NEW_DEVICE_IDENTIFIER in $target_fstab."
+		sudo sed -i "s#$OLD_DEVICE_IDENTIFIER#$NEW_DEVICE_IDENTIFIER#g" "$target_fstab"
+	else
+		# If no /boot/efi entry exists, warn the user.
+		whiptail --title "Warning" --msgbox "No existing /boot/efi entry was found in the target's /etc/fstab. Please verify it manually after this process." 10 78
+	fi
+}
+
+# ==============================================================================
+# FUNCTION: FUN_GRUB_REINSTALL_BTRFS_CHROOT
+#
+# DESCRIPTION:
+#   Manages the entire GRUB reinstallation process for a BTRFS filesystem.
+#
+# ==============================================================================
+function FUN_GRUB_REINSTALL_BTRFS_CHROOT {
+	FUN_OBTAIN_EFI_ESP_PARTITION_DEV
+
+	OS_PARTITION_MOUNT_LOCATION="/tmp/MOUNT-GRUB-REINSTALL-$(echo $JUST_OS_PARTITION_DEV | sed 's|/dev/||g')"
+	mkdir -p "$OS_PARTITION_MOUNT_LOCATION"
+
+	trap 'FUN_CLEANUP_CHROOT "$OS_PARTITION_MOUNT_LOCATION"' EXIT
+
+	sudo mount $JUST_OS_PARTITION_DEV $OS_PARTITION_MOUNT_LOCATION
+	COUNT_TOTAL_BTRFS_SUBVOLUMES=$(sudo btrfs subvolume list "$OS_PARTITION_MOUNT_LOCATION" | wc -l)
+	NL_BTRFS_SUBVOLUMES=$(sudo btrfs subvolume list "$OS_PARTITION_MOUNT_LOCATION" | sed -n 's+^.*path ++p' | cat -n | sed 's/^[[:space:]]*//g')
+
+	if [ $COUNT_TOTAL_BTRFS_SUBVOLUMES -eq 0 ]; then
+		whiptail --title "BTRFS Filesystem Has No Subvolumes" --msgbox "The selected BTRFS partition has no subvolumes. The installation will proceed by mounting the filesystem root." 8 78
+		sudo umount $OS_PARTITION_MOUNT_LOCATION
+
+		cat <<EOF >/tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp
+OS PARTITION          :: [$JUST_OS_PARTITION_DEV]
+BTRFS FS NO/SUBVOLUME :: [NO SUBVOLUME(S) FOR SELECTED BTRFS FS]
+EFI/ESP PARTITION     :: [$EFI_ESP_PARTITION_DEV]
+EOF
+		if ! whiptail --title "! Sanity Check 1 !! Proceed?" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+			echo "USER ABORTED"
+			exit
+		fi
+		if ! whiptail --title "! Sanity Check 2 !! Please Check Carefully!" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+			echo "USER ABORTED"
+			exit
+		fi
+
+		sudo mount $JUST_OS_PARTITION_DEV $OS_PARTITION_MOUNT_LOCATION
+
+		FUN_FSTAB_FIXER "$OS_PARTITION_MOUNT_LOCATION/etc/fstab"
+
+		sudo mount "${EFI_ESP_PARTITION_DEV}" "$OS_PARTITION_MOUNT_LOCATION"/boot/efi
+		sudo mount -B /dev "$OS_PARTITION_MOUNT_LOCATION"/dev
+		sudo mount -B /dev/pts "$OS_PARTITION_MOUNT_LOCATION"/dev/pts
+		sudo mount -B /proc "$OS_PARTITION_MOUNT_LOCATION"/proc
+		sudo mount -B /sys "$OS_PARTITION_MOUNT_LOCATION"/sys
+		sudo mount -B /usr "$OS_PARTITION_MOUNT_LOCATION"/usr
+
+		cat <<EOF | sudo chroot "$OS_PARTITION_MOUNT_LOCATION"
+chmod +x /etc/grub.d/*
+sudo grub-install ${EFI_ESP_PARTITION_DEV}
+sudo update-grub
+sudo grub-install --recheck ${EFI_ESP_PARTITION_DEV}
+EOF
+	fi
+
+	if [ "$COUNT_TOTAL_BTRFS_SUBVOLUMES" -ge 1 ]; then
+		CHOICE_FOR_BTRFS_SUBVOLUME=$(whiptail --fullbuttons --cancel-button "Procede w/no Subvol" --backtitle "Procede w/o Subvol [maybe target under the FS root?]" --title "Select [ BTRFS ROOT SUBVOLUME ] (default is @ on most systems)" --menu "Select [ BTRFS ROOT SUBVOLUME ] for [$JUST_OS_PARTITION_DEV]" 0 65 $COUNT_TOTAL_BTRFS_SUBVOLUMES $NL_BTRFS_SUBVOLUMES 3>&1 1>&2 2>&3)
+		_BTRFS_SUBVOLUME_TARGET_SANITIZED=$(echo "$NL_BTRFS_SUBVOLUMES" | grep -w "^$CHOICE_FOR_BTRFS_SUBVOLUME" | awk '{print $2}')
+
+		if [ -z "$CHOICE_FOR_BTRFS_SUBVOLUME" ]; then
+			if whiptail --fullbuttons --title "Will Continue w/o Subvolume" --yesno "You did not select a subvolume. Do you want to proceed by mounting the top-level of the BTRFS filesystem instead?" 8 78; then
+				sudo umount $OS_PARTITION_MOUNT_LOCATION
+				cat <<EOF >/tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp
+OS PARTITION          :: [$JUST_OS_PARTITION_DEV]
+BTRFS ROOT SUBVOLUME  :: [ Chose None - Targeting the filesystem root ]
+EFI/ESP PARTITION     :: [$EFI_ESP_PARTITION_DEV]
+EOF
+
+				if ! whiptail --title "! Sanity Check 1 !! Proceed?" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+					echo "USER ABORTED"
+					exit
+				fi
+				if ! whiptail --title "! Sanity Check 2 !! Please Check Carefully!" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+					echo "USER ABORTED"
+					exit
+				fi
+
+				sudo mount $JUST_OS_PARTITION_DEV $OS_PARTITION_MOUNT_LOCATION
+
+				FUN_FSTAB_FIXER "$OS_PARTITION_MOUNT_LOCATION/etc/fstab"
+
+				sudo mount "${EFI_ESP_PARTITION_DEV}" "$OS_PARTITION_MOUNT_LOCATION"/boot/efi
+				sudo mount -B /dev "$OS_PARTITION_MOUNT_LOCATION"/dev
+				sudo mount -B /dev/pts "$OS_PARTITION_MOUNT_LOCATION"/dev/pts
+				sudo mount -B /proc "$OS_PARTITION_MOUNT_LOCATION"/proc
+				sudo mount -B /sys "$OS_PARTITION_MOUNT_LOCATION"/sys
+				sudo mount -B /usr "$OS_PARTITION_MOUNT_LOCATION"/usr
+
+				cat <<EOF | sudo chroot "$OS_PARTITION_MOUNT_LOCATION"
+chmod +x /etc/grub.d/*
+sudo grub-install ${EFI_ESP_PARTITION_DEV}
+sudo update-grub
+sudo grub-install --recheck ${EFI_ESP_PARTITION_DEV}
+EOF
+			fi
+
+		elif [ -n "$CHOICE_FOR_BTRFS_SUBVOLUME" ]; then
+			sudo umount $OS_PARTITION_MOUNT_LOCATION
+			cat <<EOF >/tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp
+OS PARTITION          :: [$JUST_OS_PARTITION_DEV]
+BTRFS ROOT SUBVOLUME  :: [$_BTRFS_SUBVOLUME_TARGET_SANITIZED]
+EFI/ESP PARTITION     :: [$EFI_ESP_PARTITION_DEV]
+EOF
+
+			if ! whiptail --title "! Sanity Check 1 !! Proceed?" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+				echo "USER ABORTED"
+				exit
+			fi
+			if ! whiptail --title "! Sanity Check 2 !! Please Check Carefully!" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 12 78; then
+				echo "USER ABORTED"
+				exit
+			fi
+
+			sudo mount "$JUST_OS_PARTITION_DEV" -o subvol="$_BTRFS_SUBVOLUME_TARGET_SANITIZED" "$OS_PARTITION_MOUNT_LOCATION"
+
+			FUN_FSTAB_FIXER "$OS_PARTITION_MOUNT_LOCATION/etc/fstab"
+
+			sudo mount "${EFI_ESP_PARTITION_DEV}" "$OS_PARTITION_MOUNT_LOCATION"/boot/efi
+			sudo mount -B /dev "$OS_PARTITION_MOUNT_LOCATION"/dev
+			sudo mount -B /dev/pts "$OS_PARTITION_MOUNT_LOCATION"/dev/pts
+			sudo mount -B /proc "$OS_PARTITION_MOUNT_LOCATION"/proc
+			sudo mount -B /sys "$OS_PARTITION_MOUNT_LOCATION"/sys
+			sudo mount -B /usr "$OS_PARTITION_MOUNT_LOCATION"/usr
+
+			cat <<EOF | sudo chroot "$OS_PARTITION_MOUNT_LOCATION"
+chmod +x /etc/grub.d/*
+sudo grub-install ${EFI_ESP_PARTITION_DEV}
+sudo update-grub
+sudo grub-install --recheck ${EFI_ESP_PARTITION_DEV}
+EOF
+		fi
+	else
+		echo "USER ABORTED"
+	fi
+
+	FUN_CLEANUP_CHROOT "$OS_PARTITION_MOUNT_LOCATION"
+	trap - EXIT
+}
+
+# ==============================================================================
+# FUNCTION: FUN_GRUB_REINSTALL_EXT4_CHROOT
+#
+# DESCRIPTION:
+#   Manages the GRUB reinstallation process for a standard EXT4 filesystem.
+#
+# ==============================================================================
+function FUN_GRUB_REINSTALL_EXT4_CHROOT {
+	FUN_OBTAIN_EFI_ESP_PARTITION_DEV
+
+	cat <<EOF >/tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp
+OS PARTITION      :: [$JUST_OS_PARTITION_DEV]
+EFI/ESP PARTITION :: [$EFI_ESP_PARTITION_DEV]
+EOF
+
+	if ! whiptail --title "! Sanity Check 1 !! Proceed?" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 10 78; then
+		echo "USER ABORTED"
+		exit
+	fi
+	if ! whiptail --title "! Sanity Check 2 !! Please Check Carefully!" --yesno "$(cat /tmp/custom-GRUB-REINSTALL-SELECTED-PARTITONS-MESSAGE.tmp)" 10 78; then
+		echo "USER ABORTED"
+		exit
+	fi
+
+	OS_PARTITION_MOUNT_LOCATION="/tmp/MOUNT-GRUB-REINSTALL-$(echo $JUST_OS_PARTITION_DEV | sed 's|/dev/||g')"
+	mkdir -p "$OS_PARTITION_MOUNT_LOCATION"
+
+	trap 'FUN_CLEANUP_CHROOT "$OS_PARTITION_MOUNT_LOCATION"' EXIT
+
+	sudo mount $JUST_OS_PARTITION_DEV $OS_PARTITION_MOUNT_LOCATION
+
+	FUN_FSTAB_FIXER "$OS_PARTITION_MOUNT_LOCATION/etc/fstab"
+
+	echo -e "\nMounting EFI partition to ${OS_PARTITION_MOUNT_LOCATION}/boot/efi"
+	sudo mount "${EFI_ESP_PARTITION_DEV}" "$OS_PARTITION_MOUNT_LOCATION"/boot/efi
+	echo -e "Binding /dev to ${OS_PARTITION_MOUNT_LOCATION}/dev"
+	sudo mount -B /dev "$OS_PARTITION_MOUNT_LOCATION"/dev
+	echo -e "Binding /dev/pts to ${OS_PARTITION_MOUNT_LOCATION}/dev/pts"
+	sudo mount -B /dev/pts "$OS_PARTITION_MOUNT_LOCATION"/dev/pts
+	echo -e "Binding /proc to ${OS_PARTITION_MOUNT_LOCATION}/proc"
+	sudo mount -B /proc "$OS_PARTITION_MOUNT_LOCATION"/proc
+	echo -e "Binding /sys to ${OS_PARTITION_MOUNT_LOCATION}/sys"
+	sudo mount -B /sys "$OS_PARTITION_MOUNT_LOCATION"/sys
+	echo -e "Binding /usr to ${OS_PARTITION_MOUNT_LOCATION}/usr"
+	sudo mount -B /usr "$OS_PARTITION_MOUNT_LOCATION"/usr
+
+	echo "Now changing root into other system's terminal... (chroot)"
+	echo -e "\n *WARNING!! You may need to Edit/Remove the previous EFI partition mount point in *[/etc/fstab]*  If you still encounter problems booting/entering into your Linux System \n"
+	echo "The following commands will be executed inside the chroot environment:"
+	echo "1. sudo grub-install ${EFI_ESP_PARTITION_DEV}"
+	echo "2. sudo update-grub"
+	echo "3. sudo grub-install --recheck ${EFI_ESP_PARTITION_DEV}"
+
+	cat <<EOF | sudo chroot "$OS_PARTITION_MOUNT_LOCATION"
+chmod +x /etc/grub.d/*
+sudo grub-install ${EFI_ESP_PARTITION_DEV}
+sudo update-grub
+sudo grub-install --recheck ${EFI_ESP_PARTITION_DEV}
+EOF
+
+	FUN_CLEANUP_CHROOT "$OS_PARTITION_MOUNT_LOCATION"
+	trap - EXIT
+}
+
+# ==============================================================================
+# FUNCTION: FUN_OBTAIN_JUST_OS_PARTITION_DEV
+#
+# DESCRIPTION:
+#   Identifies all BTRFS and EXT4 partitions and prompts the user to select
+#   the target OS partition. The result is stored in a global variable.
+#
+# ==============================================================================
+
+function FUN_OBTAIN_JUST_OS_PARTITION_DEV {
+	# Get ext4 and btrfs partitions with fields NAME, FSTYPE, LABEL, SIZE, FSVER (optional)
+	readarray -t os_partitions < <(
+		lsblk --list -n -o NAME,FSTYPE,LABEL,SIZE | grep -E "ext4|btrfs"
+	)
+
+	i=1
+	options=()
+	declare -A id_map
+
+	for line in "${os_partitions[@]}"; do
+		if [ -n "$line" ]; then
+			read -r name fstype label size <<<"$line"
+			if [ -z "$size" ]; then
+				size="$label"
+				label="-" # placeholder for missing label
+			fi
+
+			_tag="/dev/$name"
+			# Pretty padded columns for menu display
+			_item=$(printf "%-6s %-15s %-6s" "$fstype" "$label" "$size")
+
+			options+=("$_tag" "$_item")
+			id_map[$i]="$line"
+			((i++))
+		fi
+	done
+
+	height="${#id_map[@]}"
+
+	CHOICE_FOR_OS_PARTITION=$(whiptail --title "Select OS Partition (ext4/btrfs)" \
+		--menu "Choose your OS partition:" 0 0 "$height" "${options[@]}" \
+		3>&1 1>&2 2>&3)
+
+	if [ -z "$CHOICE_FOR_OS_PARTITION" ]; then
+		echo "User aborted. Exiting..." >&2
+		exit 1
+	fi
+
+	JUST_OS_PARTITION_DEV=$(echo "$CHOICE_FOR_OS_PARTITION" | tr -d '[:space:]')
+
+	echo "JUST_OS_PARTITION_DEV is ::: $JUST_OS_PARTITION_DEV"
+}
+
+# ==============================================================================
+# FUNCTION: FUN_OBTAIN_EFI_ESP_PARTITION_DEV
+#
+# DESCRIPTION:
+#   Identifies all VFAT (FAT32) partitions, which are used for the EFI System
+#   Partition (ESP), and prompts the user to select one.
+#
+# ==============================================================================
+
+function FUN_OBTAIN_EFI_ESP_PARTITION_DEV {
+
+	readarray -t efi_partitions < <(lsblk --list -n -o NAME,FSTYPE,FSVER,LABEL,SIZE | grep -w "vfat")
+	i=1
+	options=()
+	declare -A id_map
+
+	for line in "${efi_partitions[@]}"; do
+		if [ -n "$line" ]; then
+			read -r name fstype fsver label size <<<"$line"
+			if [ -z "$size" ]; then
+				size="$label"
+				label="-" # placeholder if missing LABEL
+			fi
+			_tag="/dev/$name"
+			# printf formmatted string output (padded) for pretty table
+			_item=$(printf "%-6s %-6s %-15s %-6s" "$fstype" "$fsver" "$label" "$size")
+
+			options+=("$_tag" "$_item")
+			id_map[$i]="$line"
+			((i++))
+		fi
+	done
+
+	height="${#id_map[@]}"
+
+	EFI_PARTITION_SELECTION=$(whiptail --title "SELECT [EFI/ESP] PARTITION" \
+		--menu "SELECT THE [EFI/ESP] PARTITION" 0 0 "$height" "${options[@]}" \
+		3>&1 1>&2 2>&3)
+
+	echo "EFI_PARTITION_SELECTION is ::: $EFI_PARTITION_SELECTION"
+
+	if [ -z "$EFI_PARTITION_SELECTION" ]; then
+		echo "USER ABORTED"
+		exit
+	fi
+
+	# Clean whitespace (just in case) from selection
+	EFI_ESP_PARTITION_DEV=$(echo $EFI_PARTITION_SELECTION | tr -d '[:space:]')
+
+	#debug echo "EFI_ESP_PARTITION_DEV is ::: $EFI_ESP_PARTITION_DEV"
+	echo "EFI_ESP_PARTITION_DEV is ::: $EFI_ESP_PARTITION_DEV"
+
+}
+
+##############################################################################
+##############################################################################
+#
+#                                SCRIPT START
+#
+##############################################################################
+##############################################################################
+
+NEWT_COLORS='textbox=white,green
+    shadow=,red
+    button=black,cyan
+    actbutton=white,cyan
+    actcheckbox=lightgray,cyan
+    actlistbox=black,cyan
+    acttextbox=black,cyan
+    fullscale=,cyan
+    roottext=lightgrey,black
+'
+export NEWT_COLORS
+
+cat <<EOF >/tmp/custom-GRUB-REINSTALL-TARGET-OS-INSIDE-OR-OUT.tmp
+From where are you running this script?
+
+  [Inside Target System]
+    - Use this if you can boot into the Linux system
+      where you want to reinstall GRUB, but the
+      bootloader is misconfigured.
+
+  [Outside Target System]
+    - Use this if you are running from a Live USB/CD
+      because the target system will not boot at all.
+      This will use chroot.
+
+EOF
+
+INSIDE_OR_OUTSIDE_TARGET_OS=$(whiptail --title "Select Environment" --menu "$(cat /tmp/custom-GRUB-REINSTALL-TARGET-OS-INSIDE-OR-OUT.tmp)" 0 0 2 \
+	1 "Reinstalling GRUB 2 [Inside Target System] (System is bootable)" \
+	2 "Reinstalling GRUB 2 [Outside Target System] (e.g., from a Live USB)" 3>&1 1>&2 2>&3)
+
+if [ -z $INSIDE_OR_OUTSIDE_TARGET_OS ]; then
+	echo "USER ABORTED"
+	exit
+
+# --- Workflow 1: Running from INSIDE the target OS (No Chroot) ---
+elif [ $INSIDE_OR_OUTSIDE_TARGET_OS -eq 1 ]; then
+	if mountpoint -q /boot/efi; then
+		echo "Unmounting current EFI partition at /boot/efi..."
+		sudo umount /boot/efi
+	fi
+
+	FUN_OBTAIN_EFI_ESP_PARTITION_DEV
+
+	FUN_FSTAB_FIXER "/etc/fstab"
+
+	echo "Mounting new EFI partition via /etc/fstab..."
+	sudo mount /boot/efi
+
+	echo "Running grub-install..."
+	sudo grub-install
+	echo "Running grub-install --recheck..."
+	sudo grub-install --recheck
+
+	whiptail --title "Success" --msgbox "GRUB has been reinstalled. Please review your /etc/fstab to ensure it is correct." 10 78
+	exit
+fi
+
+# --- Workflow 2: Running from OUTSIDE the target OS (Chroot Required) ---
+FUN_OBTAIN_JUST_OS_PARTITION_DEV
+
+if lsblk -o FSTYPE $JUST_OS_PARTITION_DEV | grep -q btrfs; then
+	whiptail --title "Filesystem Detected: BTRFS" \
+		--msgbox "OS Partition [$JUST_OS_PARTITION_DEV] :: $(lsblk $JUST_OS_PARTITION_DEV -o LABEL | sed 's/LABEL//' | tr -d '[:space:]') :: FSTYPE is [btrfs]" 8 78
+	FUN_GRUB_REINSTALL_BTRFS_CHROOT
+
+elif lsblk -o FSTYPE $JUST_OS_PARTITION_DEV | grep -q ext4; then
+	whiptail --title "Filesystem Detected: EXT4" \
+		--msgbox "OS Partition [$JUST_OS_PARTITION_DEV] :: $(lsblk $JUST_OS_PARTITION_DEV -o LABEL | sed 's/LABEL//' | tr -d '[:space:]') :: FSTYPE is [ext4]" 8 78
+	FUN_GRUB_REINSTALL_EXT4_CHROOT
+fi
+
+# --- Final exit message ---
+cat <<EOF
+(\_/) (\_/) (\_/) (\_/) (\_/) (\_/) (\_/) (\_/) (\_/) 
+(•x•) (•x•) (•x•) (•x•) (•x•) (•x•) (•x•) (•x•) (•x•)     
+(<🍦) (<🍦) (<🍦) (<🍦) (<🍦) (<🍦) (<🍦) (<🍦) (<🍦) 
+
+
+EOF
+
+unset NEWT_COLORS
