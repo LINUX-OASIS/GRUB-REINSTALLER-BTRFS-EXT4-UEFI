@@ -33,14 +33,21 @@ Made with ❤️ for the Linux community.
 
 ---
 
-## 🛠️ Tech Sparkles
+## 🛠️ Dependencies
 
-- 🐧 Bash scripting
-- 🧩 Linux utilities (`grub-install`, `update-grub`, etc.)
-- 💾 BTRFS, EXT4 filesystem operations
-- 🖥️ UEFI boot management
-- 🔒 Secure, minimal, and auditable code
-- 🔔 Logging and error handling
+The following dependencies are required for the script to run:
+- **grub2** (or **grub-efi**)
+- **btrfs-progs**
+- **e2fsprogs**
+- **efibootmgr**
+- **coreutils**
+- **util-linux**
+- **bash**
+- **sudo** (recommended for installation and system operations)
+
+> **Note:**  
+> The script will attempt to automatically install any missing dependencies using your system's package manager (e.g., `apt`, `dnf`, `pacman`, etc.).  
+> Administrative privileges may be required.
 
 ---
 
